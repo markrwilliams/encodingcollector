@@ -1,9 +1,11 @@
+from contextlib import closing
 from collections import deque, namedtuple
 import chardet
+import datetime
 
 from twisted.internet import defer, endpoints, protocol, task, threads
 from twisted.python import threadpool
-from twisted.logger import Logger
+from twisted.logger import Logger, textFileLogObserver, globalLogBeginner
 from twisted.words.protocols import irc
 import sys
 import sqlite3
@@ -55,47 +57,144 @@ class Persists(object):
     _log = Logger()
 
     SCHEMA = """
-    CREATE TABLE IF NOT EXISTS encodings (name TEXT, count INT);
-    CREATE TABLE IF NOT EXISTS summary (total INT, utf8 INT);
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS runs (
+                                 id INTEGER,
+                                 start DATETIME,
+                                 stop DATETIME,
+                                 CONSTRAINT n_pk PRIMARY KEY(id)
+                               );
+    CREATE TABLE IF NOT EXISTS networks (
+                                 id INTEGER,
+                                 address TEXT,
+                                 port INTEGER,
+                                 CONSTRAINT n_pk PRIMARY KEY(id)
+                               );
+    CREATE TABLE IF NOT EXISTS runs_networks (
+                                 run INTEGER,
+                                 network INTEGER,
+                                 CONSTRAINT nr_rn PRIMARY KEY(run, network),
+                                 FOREIGN KEY(run) REFERENCES runs(id),
+                                 FOREIGN KEY(network) REFERENCES networks(id)
+    );
+    CREATE TABLE IF NOT EXISTS encodings (
+                                 id INTEGER,
+                                 run INTEGER,
+                                 network INTEGER,
+                                 name TEXT,
+                                 count INTEGER,
+                                 FOREIGN KEY(run) REFERENCES runs(id),
+                                 CONSTRAINT encodings_pk PRIMARY KEY(id)
+                                 CONSTRAINT encodings_rn UNIQUE(run, network)
+                               );
+    CREATE TABLE IF NOT EXISTS summary (
+                                 id INTEGER,
+                                 run INTEGER,
+                                 network INTEGER,
+                                 total INTEGER,
+                                 utf8 INTEGER,
+                                 FOREIGN KEY(run) REFERENCES runs(id),
+                                 CONSTRAINT summary_pk PRIMARY KEY(id),
+                                 CONSTRAINT summary_rn UNIQUE(run, network)
+                               );
     """
+
+    now = datetime.datetime.now
 
     def __init__(self, reactor, threadPool):
         self.reactor = reactor
         self.threadPool = threadPool
+        self.networkIDs = {}
 
-    def start(self, path):
-        self.connection = sqlite3.connect(path)
+    def start(self, path, addresses):
+        self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.executescript(self.SCHEMA)
+
+        self.networkIDs = self._beginRun(addresses)
+
         self.threadPool.start()
 
     def stop(self):
         self.threadPool.stop()
+
+        self._endRun()
+
         self.connection.close()
 
-    def _incrementEncoding(self, txn, encoding):
+    def _beginRun(self, addresses):
+        runQ = '''
+        INSERT INTO runs (start) VALUES (?)
+        '''
+
+        networkQ = '''
+        INSERT OR REPLACE INTO networks (address, port) VALUES (?, ?)
+        '''
+
+        runsNetworksQ = '''
+        INSERT INTO runs_networks VALUES (?, ?)
+        '''
+        with self.connection:
+            with closing(self.connection.cursor()) as runCursor:
+                runCursor.execute(runQ, (self.now(),))
+                self.runID = runCursor.lastrowid
+
+            runNetworks = []
+            networkIDs = {}
+            with closing(self.connection.cursor()) as addressCursor:
+                for addr in addresses:
+                    addressCursor.execute(networkQ, addr)
+                    networkID = addressCursor.lastrowid
+                    runNetworks.append((self.runID, networkID))
+                    networkIDs[addr] = networkID
+
+            with closing(self.connection.cursor()) as networksRunsCursor:
+                networksRunsCursor.executemany(runsNetworksQ, runNetworks)
+        return networkIDs
+
+    def _endRun(self):
+        if self.runID is None:
+            raise ValueError("Must call start before stop!")
+
+        q = '''
+        UPDATE runs SET stop = ? WHERE id = ?
+        '''
+        with self.connection:
+            self.connection.execute(q, (self.now(), self.runID))
+
+    def _incrementEncoding(self, txn, networkID, encoding):
         q = '''
         INSERT OR REPLACE INTO encodings
-          VALUES (?, COALESCE((SELECT count FROM encodings WHERE name = ?),
-                               0) + 1)
+          (run, network, name, count)
+          VALUES (?,
+                  ?,
+                  ?,
+                  COALESCE((SELECT count FROM encodings WHERE name = ?), 0)
+                    + 1)
         '''
-        txn.execute(q, (encoding,))
+        txn.execute(q, (self.runID, networkID, encoding, encoding))
 
-    def _incrementSummary(self, txn, isUTF8):
+    def _incrementSummary(self, txn, networkID, isUTF8):
         q = '''
         INSERT OR REPLACE INTO summary
-          VALUES (COALESCE((SELECT total FROM summary), 0) + 1,
+          (run, network, total, utf8)
+          VALUES (?,
+                  ?,
+                  COALESCE((SELECT total FROM summary), 0) + 1,
                   COALESCE((SELECT utf8 FROM summary), 0) + ?)
         '''
-        txn.execute(q, (1 if isUTF8 else 0,))
+        txn.execute(q, (self.runID, networkID, 1 if isUTF8 else 0))
 
-    def _recordStatistics(self, encoding, isUTF8):
+    def _recordStatistics(self, networkID, encoding, isUTF8):
         with self.connection:
-            self._incrementEncoding(self.connection, encoding)
-            self._incrementSummary(self.connection, isUTF8)
+            self._incrementEncoding(self.connection, networkID, encoding)
+            self._incrementSummary(self.connection, networkID, isUTF8)
 
-    def recordStatistics(self, encoding, isUTF8):
-        threads.deferToThread(self.reactor, self.threadPool,
-                              self._recordStatistics, encoding, isUTF8)
+    def recordStatistics(self, addr, encoding, isUTF8):
+        networkID = self.networkIDs[addr]
+        d = threads.deferToThreadPool(self.reactor, self.threadPool,
+                                      self._recordStatistics,
+                                      networkID, encoding, isUTF8)
+        d.addErrback(lambda f: self._log.failure("Could not persist", f))
 
 
 class AnalyzesText(object):
@@ -108,33 +207,43 @@ class AnalyzesText(object):
 
     def detectEncoding(self, byteString):
         try:
-            encoding = chardet.detect(byteString)
+            guess = chardet.detect(byteString)
         except Exception:
             self._log.failure("Could not detect encoding of {byteString}",
                               byteString=byteString)
-            encoding = UNKNOWN
+            encoding = self.UNKNOWN
+        else:
+            encoding = guess['encoding']
+        self._log.info("Detected encoding: {encoding}", encoding=encoding)
         return encoding
 
     def isUTF8(self, byteString):
         try:
-            bytesString.decode('utf-8')
+            byteString.decode('utf-8')
         except UnicodeDecodeError:
             return False
         else:
             return True
 
-    def process(self, bytesString):
+    def process(self, addr, bytesString):
         self.persister.recordStatistics(
+            addr,
             encoding=self.detectEncoding(bytesString),
-            isUTF8=isUTF8(bytesString),
+            isUTF8=self.isUTF8(bytesString),
         )
 
 
 class EncodingCollectionBot(irc.IRCClient):
     nickname = "encodingcollecto"
+    _log = Logger()
+    addr = None
 
-    def __init__(self):
+    def __init__(self, reactor, rnd, analyzer):
         self._channelBuffers = []
+
+        self._reactor = reactor
+        self._random = rnd
+        self._analyzer = analyzer
 
     @defer.inlineCallbacks
     def signedOn(self):
@@ -144,83 +253,77 @@ class EncodingCollectionBot(irc.IRCClient):
                 channel = yield iterator.get()
             except StopIteration:
                 break
-            log.msg("Joining %r" % channel.name)
-            yield task.deferLater(self.factory.reactor,
-                                  self.factory.rnd.randint(1, 5),
+            self._log.info("Joining {channel}", channel=channel)
+            yield task.deferLater(self._reactor,
+                                  self._random.randint(1, 5),
                                   lambda: None)
             self.join(channel.name)
 
     def joined(self, channel):
-        try:
-            channel.name.decode('utf-8')
-        except UnicodeDecodeError:
-
+        self._log.info("Joined {channel}", channel=repr(channel))
+        self._analyzer.process(self.addr, channel)
 
     def listChannels(self):
-        iterator = DeferredBuffer()
-        self._channelBuffers.append(iterator)
+        buffer = DeferredBuffer()
+        self._channelBuffers.append(buffer)
         self._listAllChannels()
-        return iterator
+        return buffer
 
     def _listAllChannels(self):
         self.sendLine("LIST")
 
     def irc_RPL_LIST(self, prefix, params):
         channel = Channel(*params[1:])
-        for iterator in self._channelBuffers:
-            iterator.push(channel)
+        for buffer in self._channelBuffers:
+            buffer.push(channel)
 
     def irc_RPL_LISTEND(self, prefix, params):
-        for iterator in self._channelBuffers:
-            iterator.stop()
+        for buffer in self._channelBuffers:
+            buffer.stop()
 
     def privmsg(self, user, channel, message):
-        try:
-            message.decode('utf-8')
-        except UnicodeError:
-            pass
-        else:
-            self.factory.utf_8 += 1
-        self.factory.total += 1
+        self._analyzer.process(self.addr, user)
+        self._analyzer.process(self.addr, channel)
+        self._analyzer.process(self.addr, message)
 
 
 class EncodingCollectionFactory(protocol.ReconnectingClientFactory):
     protocol = EncodingCollectionBot
-    total = 0
-    utf_8 = 0
 
-    loopingPrint = None
+    def __init__(self, reactor, rnd, analyzer):
+        self._reactor = reactor
+        self._random = rnd
+        self._analyzer = analyzer
 
-    def __init__(self, reactor):
-        self.reactor = reactor
-        self.rnd = random.SystemRandom()
-
-    def startLoopingPrint(self):
-        self.loopingPrint = task.LoopingCall(self.loopingPrint)
-        self.loopingPrint.reactor = self.reactor
-        self.loopingPrint.start(30)
-
-    def stopLoopingPrint(self):
-        if self.loopingPrint:
-            self.loopingPrint.stop()
-
-    def loopingPrint(self):
-        total = float(self.total)
-        if total:
-            utf_8_pct = self.utf_8 / total
-        else:
-            utf_8_pct = 0
-
-        print "utf-8: {} ({})".format(utf_8_pct, self.total)
+    def buildProtocol(self, addr):
+        p = self.protocol(self._reactor, self._random, self._analyzer)
+        p.factory = self
+        return p
 
 
-def main(reactor, description):
-    from twisted.python import log
-    log.startLogging(sys.stdout)
-    endpoint = endpoints.clientFromString(reactor, description)
-    factory = EncodingCollectionFactory(reactor)
-    factory.startLoopingPrint()
-    d = endpoint.connect(factory)
-    return d.addCallback(lambda ignored: defer.Deferred())
+@defer.inlineCallbacks
+def main(reactor, *descriptions):
+    globalLogBeginner.beginLoggingTo([textFileLogObserver(sys.stdout)])
+    endpointObjects = [endpoints.clientFromString(reactor, description)
+                       for description in descriptions]
+    hostPorts = [(endpoint._host, endpoint._port)
+                 for endpoint in endpointObjects]
+
+    pool = threadpool.ThreadPool(minthreads=1, maxthreads=1, name="persiter")
+    persister = Persists(reactor, pool)
+    reactor.addSystemEventTrigger("before", "shutdown", persister.stop)
+    persister.start("/tmp/log.sqlite", hostPorts)
+
+    analyzer = AnalyzesText(persister)
+
+    factory = EncodingCollectionFactory(reactor,
+                                        random.SystemRandom(),
+                                        analyzer)
+
+    for (host, port), endpoint in zip(hostPorts, endpointObjects):
+        protocol = yield endpoint.connect(factory)
+        protocol.addr = (host, port)
+
+    defer.returnValue(defer.Deferred())
 
 task.react(main, ['tcp:irc.dal.net:6667'])
