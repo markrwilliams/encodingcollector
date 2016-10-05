@@ -85,7 +85,9 @@ class Persists(object):
                                  count INTEGER,
                                  FOREIGN KEY(run) REFERENCES runs(id),
                                  CONSTRAINT encodings_pk PRIMARY KEY(id)
-                                 CONSTRAINT encodings_rn UNIQUE(run, network)
+                                 CONSTRAINT encodings_rn UNIQUE(run,
+                                                                network,
+                                                                name)
                                );
     CREATE TABLE IF NOT EXISTS summary (
                                  id INTEGER,
@@ -303,6 +305,7 @@ class EncodingCollectionFactory(protocol.ReconnectingClientFactory):
 
 @defer.inlineCallbacks
 def main(reactor, *descriptions):
+    log = Logger()
     globalLogBeginner.beginLoggingTo([textFileLogObserver(sys.stdout)])
     endpointObjects = [endpoints.clientFromString(reactor, description)
                        for description in descriptions]
@@ -312,7 +315,7 @@ def main(reactor, *descriptions):
     pool = threadpool.ThreadPool(minthreads=1, maxthreads=1, name="persiter")
     persister = Persists(reactor, pool)
     reactor.addSystemEventTrigger("before", "shutdown", persister.stop)
-    persister.start("/tmp/log.sqlite", hostPorts)
+    persister.start("log.sqlite", hostPorts)
 
     analyzer = AnalyzesText(persister)
 
@@ -321,9 +324,16 @@ def main(reactor, *descriptions):
                                         analyzer)
 
     for (host, port), endpoint in zip(hostPorts, endpointObjects):
-        protocol = yield endpoint.connect(factory)
+        try:
+            protocol = yield endpoint.connect(factory)
+        except Exception:
+            log.failure("Could not connect to {host}:{port}",
+                        host=host, port=port)
+            raise
         protocol.addr = (host, port)
 
     defer.returnValue(defer.Deferred())
 
-task.react(main, ['tcp:irc.dal.net:6667'])
+task.react(main, ['tcp:irc.dal.net:6667',
+                  'tcp:chat.freenode.net:6667',
+                  'tcp:irc.chatnet.ru:6667'])
