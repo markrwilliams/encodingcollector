@@ -166,25 +166,45 @@ class Persists(object):
     def _incrementEncoding(self, txn, networkID, encoding):
         q = '''
         INSERT OR REPLACE INTO encodings
-          (run, network, name, count)
-          VALUES (?,
-                  ?,
-                  ?,
-                  COALESCE((SELECT count FROM encodings WHERE name = ?), 0)
-                    + 1)
+          (id, run, network, name, count)
+          VALUES ((SELECT id FROM encodings WHERE
+                       run = :run
+                   AND network = :network
+                   AND name = :name),
+                  :run,
+                  :network,
+                  :name,
+                  COALESCE((SELECT count FROM encodings WHERE
+                                   run = :run
+                               AND network = :network
+                               AND name = :name),
+                           0) + 1)
         '''
-        txn.execute(q, (self.runID, networkID, encoding, encoding))
+        txn.execute(q, {"run": self.runID,
+                        "network": networkID,
+                        "name": encoding})
 
     def _incrementSummary(self, txn, networkID, isUTF8):
         q = '''
         INSERT OR REPLACE INTO summary
-          (run, network, total, utf8)
-          VALUES (?,
-                  ?,
-                  COALESCE((SELECT total FROM summary), 0) + 1,
-                  COALESCE((SELECT utf8 FROM summary), 0) + ?)
+          (id, run, network, total, utf8)
+          VALUES ((SELECT id FROM summary WHERE
+                                  run = :run
+                              AND network = :network),
+                  :run,
+                  :network,
+                  COALESCE((SELECT total FROM summary WHERE
+                                             run = :run
+                                         AND network = :network),
+                           0) + 1,
+                  COALESCE((SELECT utf8 FROM summary WHERE
+                                             run = :run
+                                         AND network = :network),
+                           0) + :utf8_increment)
         '''
-        txn.execute(q, (self.runID, networkID, 1 if isUTF8 else 0))
+        txn.execute(q, {"run": self.runID,
+                        "network": networkID,
+                        "utf8_increment": 1 if isUTF8 else 0})
 
     def _recordStatistics(self, networkID, encoding, isUTF8):
         with self.connection:
@@ -336,4 +356,24 @@ def main(reactor, *descriptions):
 
 task.react(main, ['tcp:irc.dal.net:6667',
                   'tcp:chat.freenode.net:6667',
-                  'tcp:irc.chatnet.ru:6667'])
+                  'tcp:irc.kahkaha.gen.tr:6667',
+                  'tcp:irc.bks-tv.ru:6667',
+                  'tcp:irc.bryansk.ru:6667',
+                  'tcp:irc.chatnet.ru:6667',
+                  'tcp:ircluxe.ru:6667',
+                  'tcp:irc.livedubna.ru:6667',
+                  'tcp:irc.nfsrb.ru:6667',
+                  'tcp:irc.prioz.ru:6667',
+                  'tcp:irc.de.solarnet.ru:6667',
+                  'tcp:irc.tolcom.ru:6667',
+                  'tcp:irc.ykt.ru:6667',
+                  'tcp:debian.globalirc.it:6667',
+                  'tcp:linux.globalirc.it:6667',
+                  'tcp:london.globalirc.it:6667',
+                  'tcp:redhat.globalirc.it:6667',
+                  'tcp:shuttle.globalirc.it:6667',
+                  'tcp:slackware.globalirc.it:6667',
+                  'tcp:ubuntu.globalirc.it:6667',
+                  'tcp:windows.globalirc.it:6667',
+                  'tcp:mistero.ircgate.it:6667',
+              ])
